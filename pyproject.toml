@@ -1,0 +1,15 @@
+[project]
+name = "rl_learning"
+version = "0.0.1"
+dependencies = [
+    "setuptools",
+    "wheel",
+    "gymnasium[all]",
+    "torch",
+    "numpy",
+    "jaxtyping",
+    "black",
+    "scipy",
+    "pyyaml",
+    "pylint"
+]
