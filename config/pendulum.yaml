@@ -1,0 +1,25 @@
+---
+ac:
+  hidden_dim:
+   64
+  n_layers: 1
+env: 
+  id: CartPole-v1
+  render_mode: rgb-array
+ppo: 
+  gamma: 0.99
+  lmbda: 0.97
+  eps: 0.2
+  steps_per_epoch: 2000
+  episode_length:  500
+  max_reward: 500
+
+train: 
+  epochs: 25
+  pi_train_steps: 80
+  v_train_steps: 80
+
+pi_lr: 0.0003
+v_lr: 0.001
+processes: 4
+device: cpu

@@ -1,0 +1,24 @@
+---
+ac:
+  hidden_dim:
+   64
+  n_layers: 2
+env: 
+  id: MountainCarContinuous-v0
+  render_mode: rgb-array
+ppo: 
+  gamma: 0.98
+  lmbda: 0.95
+  eps: 0.1
+  steps_per_epoch: 1998
+  episode_length:  999
+
+train: 
+  epochs: 2000
+  pi_train_steps: 32
+  v_train_steps: 16
+
+pi_lr: 0.0003
+v_lr: 0.003
+
+device: cpu

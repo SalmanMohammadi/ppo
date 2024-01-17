@@ -15,10 +15,57 @@ import logging
 from yaml import safe_load
 import numpy as np
 import sys
-import plotext as plt
+import os, subprocess
+from mpi4py import MPI as mpi
 
 
-def make_layers(n_layers: int, hidden_dim: int, activation=nn.Tanh):
+def get_n_processes():
+    return mpi.COMM_WORLD.Get_rank()
+
+
+def mpi_average_gradients(model: nn.Module) -> None:
+    """
+    Average contents of gradient buffers across MPI processes.
+    Also taken from spinningup
+    """
+    num_procs = get_n_processes()
+    if num_procs == 1:
+        return
+    for param in model.parameters():
+        np_grad = np.asarray(param.grad.numpy(), dtype=np.float32)
+        avg_grad_buff = np.zeros_like(np_grad, dtype=np.float32)
+        mpi.COMM_WORLD.Allreduce(np_grad, avg_grad_buff, mpi.SUM)
+        avg_grad = avg_grad[0] if np.isscalar(np_grad) else avg_grad
+        avg_grad /= num_procs()
+
+
+def mpi_fork(n, bind_to_core=False):
+    """
+    Re-launches the current script with workers linked by MPI.
+
+    Also, terminates the original process that launched it.
+
+    Taken from spinningup https://github.com/openai/spinningup/blob/038665d62d569055401d91856abb287263096178/spinup/utils/mpi_tools.py#L6
+
+    Args:
+        n (int): Number of process to split into.
+
+        bind_to_core (bool): Bind each MPI process to a core.
+    """
+    if n <= 1:
+        return
+    if os.getenv("IN_MPI") is None:
+        env = os.environ.copy()
+        env.update(MKL_NUM_THREADS="1", OMP_NUM_THREADS="1", IN_MPI="1")
+        args = ["mpirun", "-np", str(n)]
+        if bind_to_core:
+            args += ["-bind-to", "core"]
+        args += [sys.executable] + sys.argv
+        subprocess.check_call(args, env=env)
+        sys.exit()
+
+
+def get_deep_mlp(n_layers: int, hidden_dim: int, activation=nn.Tanh):
     return [l for _ in range(n_layers) for l in (nn.Linear(hidden_dim, hidden_dim), activation())]
 
 
@@ -53,7 +100,7 @@ class CategoricalActor(Actor):
         self.theta = nn.Sequential(
             nn.Linear(obs_dim, hidden_dim),
             activation(),
-            *make_layers(n_layers, hidden_dim),
+            *get_deep_mlp(n_layers, hidden_dim),
             nn.Linear(hidden_dim, act_dim),
         )
 
@@ -72,7 +119,7 @@ class GaussianActor(Actor):
         self.mu = nn.Sequential(
             nn.Linear(obs_dim, hidden_dim),
             activation(),
-            *make_layers(n_layers, hidden_dim),
+            *get_deep_mlp(n_layers, hidden_dim),
             nn.Linear(hidden_dim, act_dim),
         )
 
@@ -87,7 +134,7 @@ class Critic(nn.Module):
     def __init__(self, obs_dim: int, hidden_dim: int = 64, n_layers: int = 4, activation=nn.Tanh):
         super().__init__()
         self.phi = nn.Sequential(
-            nn.Linear(obs_dim, hidden_dim), activation(), *make_layers(n_layers, hidden_dim), nn.Linear(hidden_dim, 1)
+            nn.Linear(obs_dim, hidden_dim), activation(), *get_deep_mlp(n_layers, hidden_dim), nn.Linear(hidden_dim, 1)
         )
 
     def forward(self, obs: Float[Tensor, "batch obs_dim"]) -> Float[Tensor, "batch"]:
@@ -97,7 +144,7 @@ class Critic(nn.Module):
 class ActorCritic(nn.Module):
     def __init__(
         self,
-        obs_space: Box,
+        obs_space: Union[Box, Discrete],
         act_space: Union[Box, Discrete],
         hidden_dim: int = 64,
         n_layers: int = 4,
@@ -105,16 +152,15 @@ class ActorCritic(nn.Module):
     ):
         super().__init__()
         assert isinstance(act_space, Box) or isinstance(act_space, Discrete)
-        assert isinstance(obs_space, Box)
         if isinstance(act_space, Box):
             self.pi = GaussianActor(
                 obs_space.shape[0], act_space.shape[0], hidden_dim=hidden_dim, n_layers=n_layers, activation=activation
             )
-        elif isinstance(act_space, Discrete):
+        else:
             self.pi = CategoricalActor(
                 obs_space.shape[0], act_space.n, hidden_dim=hidden_dim, n_layers=n_layers, activation=activation
             )
-        self.v = Critic(obs_space.shape[0], hidden_dim=hidden_dim, n_layers=n_layers, activation=activation)
+        self.v = Critic(obs_space.shape[0], hidden_dim, n_layers, activation)
 
     def step(
         self, obs: Float[Tensor, "batch obs_dim"]
@@ -141,6 +187,7 @@ class PPO:
         steps_per_epoch: int,
         episode_length: int,
         device: torch.device = torch.device("cpu"),
+        max_reward: int = None,
     ):
         self.env = env
         self.ac = ac
@@ -151,6 +198,7 @@ class PPO:
         self.steps_per_epoch = steps_per_epoch
         self.reset_buffers()
         self.device = device
+        self.max_reward = max_reward
 
     def store_values(
         self,
@@ -195,7 +243,6 @@ class PPO:
     def estimate_advantage_and_return(self, terminal_value=0):
         """
         Estimates the advantage for the current trajectory using Generalized Advantage Estimation (https://arxiv.org/pdf/1506.02438.pdf).
-        (one step advantage estimation)
         """
         advantage_slice = slice(self.advantage_start_idx, self.idx)
         r_buffer = np.append(self.r_buffer[advantage_slice], terminal_value)
@@ -219,8 +266,8 @@ class PPO:
         )
 
     def v_loss(self):
-        ret = (self.return_buffer - self.return_buffer.mean()) / self.return_buffer.std()
-        return ((self.ac.v(self.obs_buffer) - ret).pow(2)).mean()
+        # ret = (self.return_buffer - self.return_buffer.mean()) / self.return_buffer.std()
+        return ((self.ac.v(self.obs_buffer) - self.return_buffer).pow(2)).mean()
 
     def policy_update(self, opt: optim.Optimizer, train_steps: int):
         total_loss, total_kl, ratios = 0, 0, 0
@@ -235,6 +282,7 @@ class PPO:
             # if kl > 0.05:
             #     break
             loss.backward()
+            mpi_average_gradients(ac.pi)
             opt.step()
         return total_loss / train_steps, total_kl / train_steps, ratios / train_steps
 
@@ -245,6 +293,7 @@ class PPO:
             loss = self.v_loss()
             total_mse += loss
             loss.backward()
+            mpi_average_gradients(ac.v)
             opt.step()
         return total_mse / train_steps
 
@@ -256,22 +305,18 @@ class PPO:
         pi_train_steps: int,
         v_train_steps: int,
     ):
-        # epoch_returns = []
-        # pi_losses = []
-        # kls = []
-        # v_losses = []
-        # ratios = []
         obs, *_ = self.env.reset()
         ep_len = 0
         ep_r = 0
+        return_buff = []
         for epoch in range(epochs):
             epoch_return = 0
             n_ep = 0
             for t in range(self.steps_per_epoch):
-                a, v, logp_a = self.ac.step(torch.as_tensor(obs, dtype=torch.float32, device=self.device))
-                a = a.cpu().item()
-                obs_, reward, terminated, *_ = env.step(a)
-
+                a, v, logp_a = self.ac.step(torch.as_tensor(obs, device=self.device, dtype=torch.float32))
+                obs_, reward, terminated, *_ = env.step(a.cpu().numpy())
+                # if obs_ == obs:
+                #     reward -= 0.01
                 ep_r += reward
                 ep_len += 1
 
@@ -291,15 +336,29 @@ class PPO:
                         v = 0
                     self.estimate_advantage_and_return(v)
                     obs, *_ = env.reset()
-                    logging.info(f"Episode length: {ep_len} return {ep_r}")
+                    logging.info(f"Episode length: {ep_len} return {ep_r:.4f}")
                     ep_len = 0
-                    # epoch_return += ep_r
+                    epoch_return += ep_r
+                    return_buff.append(ep_r)
+                    mean_length = 5
+                    if len(return_buff) > mean_length:
+                        logging.info(
+                            f"Episode {len(return_buff)}, mean return over {mean_length} episodes: {sum(return_buff[len(return_buff)-mean_length:])/mean_length:.4f}"
+                        )
                     n_ep += 1
                     # epoch_returns.append(ep_r)
                     ep_r = 0
 
+            if (
+                self.max_reward is not None
+                and sum(return_buff[len(return_buff) - mean_length :]) / mean_length >= self.max_reward
+            ):
+                logging.info(f"Max reward achieved at epoch {epoch}!")
+                break
             self.buffers_to_tensors()
             pi_loss, kl, ratio = self.policy_update(pi_opt, pi_train_steps)
+            # logging.info(f" ----- Epoch: {epoch} return {epoch_return / n_ep}  -----")x
+
             # pi_losses.append(pi_loss.detach())
             # kls.append(kl.detach())
             # ratios.append((ratio * 100).detach())
@@ -317,15 +376,16 @@ if __name__ == "__main__":
     device = torch.device(config["device"])
 
     env = gym.make(**config["env"])
-    ac = ActorCritic(env.observation_space, env.action_space, **config["ac"], activation=nn.ReLU)  # pyright: ignore
+    ac = ActorCritic(env.observation_space, env.action_space, **config["ac"], activation=nn.Tanh)  # pyright: ignore
     ac.to(device)
     ac.train()
+    print(ac)
     ppo = PPO(env, ac, **config["ppo"], device=device)
     pi_opt = optim.Adam(ac.pi.parameters(), lr=config["pi_lr"])
     v_opt = optim.Adam(ac.v.parameters(), lr=config["v_lr"])
+    mpi_fork(config["processes"])
     ppo.train(pi_opt, v_opt, **config["train"])
     env.close()
-
     env = gym.make(config["env"]["id"], render_mode="human")
     obs, *_ = env.reset()
     ac.eval()
@@ -333,8 +393,8 @@ if __name__ == "__main__":
         ret = 0
         t = 0
         for _ in range(10000):
-            a, *_ = ac.step(torch.as_tensor(obs, dtype=torch.float32))
-            obs, reward, terminated, *_ = env.step(a.item())
+            a, *_ = ac.step(torch.as_tensor(obs, dtype=torch.float32, device=device))
+            obs, reward, terminated, *_ = env.step(a.numpy())
             ret += reward
             t += 1
             if terminated:

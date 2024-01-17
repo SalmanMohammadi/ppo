@@ -3,19 +3,20 @@ ac:
   hidden_dim: 64
   n_layers: 1
 env: 
-  id: MountainCar-v0
+  id: MountainCar-v1
   render_mode: rgb-array
 ppo: 
   gamma: 0.99
   lmbda: 0.98
   eps: 0.2
-  steps_per_epoch: 400
-  episode_length:  200
+  steps_per_epoch: 50
+  episode_length:  50
+  # reward_target:
 
 train: 
-  epochs: 500
-  pi_train_steps: 16
-  v_train_steps: 16
+  epochs: 1000
+  pi_train_steps: 32
+  v_train_steps: 32
 
 pi_lr: 0.003
 v_lr: 0.003
