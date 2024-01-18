@@ -41,7 +41,11 @@ GAE helps reduce variance in estimations of the advantage function using the fol
 ```math
 \hat{A_{t}}=R_t(\lambda) - V(s_t)
 ```
-which can be derived by considering the return $R_t=\sum_{l=0}^{T-t} \gamma^{l}r_{t+l}$ as an unbiased sample of the expected return from a given state. 
+which can be derived by considering the return 
+```math
+R_t=\sum_{l=0}^{T-t} \gamma^{l}r_{t+l}
+```
+as an unbiased sample of the expected return from a given state. 
 
 However, in practice, variance in the dynamics of the policy and training result in stochasticity in the return, resulting in variance in return estimation. One method to reduce variance involves estimating the return over *n*-steps instead (similar to how we sample mini-batches in SGD). This can introduce bias in the smaller sample sizes, but may reduce overall variance from environment and agent dynamics. The remaining steps can be bootstrapped by approximating from the value function. When used with e.g. PP, which helps reduce variance in policy and value functions, this can result in stable advantage estimations which are robust to variation in training dynamics.
 Given *n* steps, the return is now:
